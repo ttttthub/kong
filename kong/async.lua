@@ -14,12 +14,13 @@ local assert = assert
 local setmetatable = setmetatable
 
 
-local LOG_INTERVAL = 60
-local BUCKET_SIZE  = 1000
-local QUEUE_SIZE   = 100000
+local TIMER_INTERVAL = 0.100
+local LOG_INTERVAL   = 60
+local BUCKET_SIZE    = 1000
+local QUEUE_SIZE     = 100000
 
 
-local RECURRING = {
+local DELAYS = {
   second = 1,
   minute = 60,
   hour   = 3600,
@@ -151,6 +152,68 @@ local function every_timer(premature, self, delay)
 end
 
 
+local function after_timer(premature, self)
+
+  -- DO NOT YIELD IN THIS FUNCTION AS IT IS EXECUTED FREQUENTLY!
+
+  if premature or self.lawn.head == 0 then
+    return true
+  end
+
+  local now = ngx.now()
+  if self.closest > now then
+    return true
+  end
+
+  local head    = self.lawn.head
+  local ttls    = self.lawn.ttls
+  local buckets = self.lawn.buckets
+
+  for i = head, 1, -1  do
+    local ttl = ttls[i]
+    local bucket = buckets[ttl]
+    local count = bucket.head
+    if count > 0 then
+      for j = 1, count do
+        local exp, job = bucket.jobs[j][1], bucket.jobs[j][2]
+        if exp < now then
+          local ok, err = job(self)
+          if not ok then
+            kong.log.err(err)
+            return
+          end
+
+          bucket.head = bucket.head - 1
+
+        else
+          break
+        end
+
+        if self.closest == 0 or self.closest > exp then
+          self.closest = exp
+        end
+      end
+
+      if bucket.head ~= count then
+        if bucket.head == 0 then
+          buckets[ttl] = kong.table.clear(bucket)
+          ttls[i] = nil
+          self.lawn.head = self.lawn.head - 1
+
+        else
+          local start = count - bucket.head
+          for _ = start, count do
+            table.remove(bucket, 1)
+          end
+        end
+      end
+    end
+  end
+
+  return true
+end
+
+
 local function create_job(func, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, ...)
   local argc = select("#", ...)
   local args = argc > 0 and { ... }
@@ -176,14 +239,14 @@ local function create_job(func, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, ...)
 end
 
 
-local function queue_job(self, recurring, func, ...)
+local function queue_job(self, is_job, func, ...)
   if get_pending(self) == QUEUE_SIZE then
     self.refused = self.refused + 1
     return nil, "async queue is full"
   end
 
   self.head = self.head == QUEUE_SIZE and 1 or self.head + 1
-  self.jobs[self.head] = recurring and func or create_job(func, ...)
+  self.jobs[self.head] = is_job and func or create_job(func, ...)
   self.time[self.head][1] = ngx.now() * 1000
   self.work:post()
 
@@ -207,6 +270,13 @@ local function create_recurring_job(job)
     end
 
     return queue_job(self, true, recurring_job)
+  end
+end
+
+
+local function create_after_job(job)
+  return function(self)
+    return queue_job(self, true, job)
   end
 end
 
@@ -292,7 +362,13 @@ function async.new()
     jobs = kong.table.new(QUEUE_SIZE, 0),
     time = time,
     work = semaphore.new(),
+    lawn = {
+      head    = 0,
+      ttls    = {},
+      buckets = {},
+    },
     buckets = {},
+    closest = 0,
     running = 0,
     errored = 0,
     refused = 0,
@@ -314,7 +390,17 @@ function async:init_worker()
     return nil, err
   end
 
-  return self:every(LOG_INTERVAL, log_timer, self)
+  ok, err = ngx.timer.every(TIMER_INTERVAL, after_timer, self)
+  if not ok then
+    return nil, err
+  end
+
+  ok, err = ngx.timer.every(LOG_INTERVAL, log_timer, self)
+  if not ok then
+    return nil, err
+  end
+
+  return true
 end
 
 
@@ -339,7 +425,7 @@ end
 -- @treturn true|nil      `true` on success, `nil` on error
 -- @treturn string|nil    `nil` on success, error message `string` on error
 function async:every(delay, func, ...)
-  delay = RECURRING[delay] or delay
+  delay = DELAYS[delay] or delay
 
   assert(type(delay) == "number" and delay > 0, "invalid delay, must be a number greater than zero or " ..
                                                 "'second', 'minute', 'hour', 'month' or 'year'")
@@ -367,6 +453,54 @@ function async:every(delay, func, ...)
 
   bucket.head = bucket.head + 1
   bucket.jobs[bucket.head] = create_recurring_job(create_job(func, ...))
+
+  return true
+end
+
+
+---
+-- Run a function after a delay
+--
+-- @tparam  number|string function execution delay (a non-zero positive number
+--                        or `"second"`, `"minute"`, `"hour"`, `"month" or `"year"`)
+-- @tparam  function      a function to run asynchronously
+-- @tparam  ...[opt]      function arguments
+-- @treturn true|nil      `true` on success, `nil` on error
+-- @treturn string|nil    `nil` on success, error message `string` on error
+function async:after(delay, func, ...)
+  delay = DELAYS[delay] or delay
+
+  assert(type(delay) == "number" and delay > 0, "invalid delay, must be a number greater than zero or " ..
+                                                "'second', 'minute', 'hour', 'month' or 'year'")
+
+  local bucket = self.lawn.buckets[delay]
+  if bucket then
+    if bucket.head == BUCKET_SIZE then
+      self.refused = self.refused + 1
+      return nil, "async bucket (" .. delay .. ") is full"
+    end
+
+  else
+    self.lawn.head = self.lawn.head + 1
+    self.lawn.ttls[self.lawn.head] = delay
+
+    bucket = {
+      jobs = kong.table.new(BUCKET_SIZE, 0),
+      head = 0,
+    }
+
+    self.lawn.buckets[delay] = bucket
+  end
+
+  local expiry = ngx.now() + delay
+
+  bucket.head = bucket.head + 1
+  bucket.jobs[bucket.head] = {
+    expiry,
+    create_after_job(create_job(func, ...)),
+  }
+
+  self.closest = math.min(self.closest, expiry)
 
   return true
 end
@@ -422,8 +556,8 @@ function async:stats(opts)
     local now = ngx.now()
 
     local all    = opts.all    and get_stats(self)
-    local minute = opts.minute and get_stats(self, now - RECURRING.minute)
-    local hour   = opts.hour   and get_stats(self, now - RECURRING.hour)
+    local minute = opts.minute and get_stats(self, now - DELAYS.minute)
+    local hour   = opts.hour   and get_stats(self, now - DELAYS.hour)
 
     local latency
     local runtime
