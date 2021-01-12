@@ -54,7 +54,7 @@ function concurrency.with_worker_mutex(opts, fn)
 end
 
 
-function concurrency.with_coroutine_mutex(opts, fn)
+function concurrency.with_coroutine_mutex(opts, fn, arg)
   if type(opts) ~= "table" then
     error("opts must be a table", 2)
   end
@@ -71,7 +71,7 @@ function concurrency.with_coroutine_mutex(opts, fn)
   end
 
   if get_phase() == "init_worker" then
-    return fn()
+    return fn(arg)
   end
 
   local timeout = opts.timeout or 60
@@ -106,7 +106,7 @@ function concurrency.with_coroutine_mutex(opts, fn)
     end
   end
 
-  local pok, ok, err = pcall(fn)
+  local pok, ok, err = pcall(fn, arg)
 
   if lok then
     -- release lock

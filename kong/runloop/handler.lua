@@ -1,5 +1,7 @@
 -- Kong runloop
 
+local req_config_shm = ngx.shared.req_config_shm
+local router_mutex_shm = ngx.shared.router_mutex_shm
 local ck           = require "resty.cookie"
 local meta         = require "kong.meta"
 local utils        = require "kong.tools.utils"
@@ -11,7 +13,7 @@ local singletons   = require "kong.singletons"
 local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
 local PluginsIterator = require "kong.runloop.plugins_iterator"
-
+local json_safe = require "cjson.safe"
 
 local kong         = kong
 local type         = type
@@ -36,8 +38,6 @@ local subsystem    = ngx.config.subsystem
 local clear_header = ngx.req.clear_header
 local unpack       = unpack
 
-
-local NOOP = function() end
 
 
 local ERR   = ngx.ERR
@@ -79,6 +79,17 @@ local _set_build_router
 local _set_router
 local _set_router_version
 
+local ROUTER_BUILD_LOCK = "router_build_lock"
+local resty_lock = require "resty.lock"
+local LOCKS_SHARED_DICT = "router_build_shm"
+local lock, err = resty_lock:new(LOCKS_SHARED_DICT)
+if not lock then
+  ngx.log(ngx.ERR, "create lock failed!"..err)
+  return
+end
+
+local pid_key = "pid"
+local access_time_key = "access_time"
 
 local update_lua_mem
 do
@@ -258,6 +269,7 @@ local function register_events()
       core_cache:invalidate("router:version")
     end
   end, "crud", "services")
+
 
 
   worker_events.register(function(data)
@@ -468,7 +480,7 @@ end
 -- nil otherwise (callback was neither called successfully nor enqueued,
 -- or an error happened).
 -- @returns error message as a second return value in case of failure/error
-local function rebuild(name, callback, version, opts)
+local function rebuild(name, callback, version, opts, is_update)
   local current_version, err = kong.core_cache:get(name .. ":version", TTL_ZERO,
                                                    utils.uuid)
   if err then
@@ -479,7 +491,7 @@ local function rebuild(name, callback, version, opts)
     return true
   end
 
-  return concurrency.with_coroutine_mutex(opts, callback)
+  return concurrency.with_coroutine_mutex(opts, callback, is_update)
 end
 
 
@@ -553,6 +565,7 @@ end
 do
   local router
   local router_version
+  local router_member_version
 
 
   -- Given a protocol, return the subsystem that handles it
@@ -648,7 +661,7 @@ do
   end
 
 
-  build_router = function(version)
+  build_router = function(version, is_update)
     local db = kong.db
     local routes, i = {}, 0
 
@@ -665,54 +678,142 @@ do
       end
     end
 
-    local counter = 0
-    local page_size = db.routes.pagination.page_size
-    for route, err in db.routes:each(nil, GLOBAL_QUERY_OPTS) do
-      if err then
-        return nil, "could not load routes: " .. err
-      end
 
-      if db.strategy ~= "off" then
-        if kong.core_cache and counter > 0 and counter % page_size == 0 then
-          local new_version, err = get_router_version()
-          if err then
-            return nil, "failed to retrieve router version: " .. err
-          end
+    --select a worker pull all routes from db and set in shm
+    local new_router, err, member_version_shm, flags
+    if is_update then
+      local counter = 0
+      local page_size = db.routes.pagination.page_size
+      for route, err in db.routes:each(nil, GLOBAL_QUERY_OPTS) do
+        if err then
+          return nil, "could not load routes: " .. err
+        end
 
-          if new_version ~= version then
-            return nil, "router was changed while rebuilding it"
+        if db.strategy ~= "off" then
+          if kong.core_cache and counter > 0 and counter % page_size == 0 then
+            local new_version, err = get_router_version()
+            if err then
+              return nil, "failed to retrieve router version: " .. err
+            end
+
+            if new_version ~= version then
+              return nil, "router was changed while rebuilding it"
+            end
           end
         end
+
+        if should_process_route(route) then
+          local service, err = get_service_for_route(db, route, services_init_cache)
+          if err then
+            return nil, err
+          end
+
+          local r = {
+            route   = route,
+            service = service,
+          }
+
+          i = i + 1
+          routes[i] = r
+        end
+
+        counter = counter + 1
       end
 
-      if should_process_route(route) then
-        local service, err = get_service_for_route(db, route, services_init_cache)
+
+      new_router, err = Router.new(routes)
+      if not new_router then
+        ngx.log(ngx.ERR, "new router object failed!", err)
+        return nil, "could not create router: " .. err
+      end
+
+      local routes_member, err = new_router.retrieveRouterMember()
+      if err then
+        ngx.log(ngx.ERR, "get router object's member variables failed!", err)
+        return nil, err
+      end
+
+      local member_enc, err = json_safe.encode(routes_member)
+      if err then
+        ngx.log(ngx.ERR, "encode routes object member failed!", err)
+        return nil, err
+      end
+
+      local succ, err, forcible = req_config_shm:set("routes", member_enc)
+      if not succ then
+        ngx.log(ngx.ERR, "shm set routes object member failed!", err)
+        return nil, err
+      end
+
+      if forcible then
+        ngx.log(ngx.ERR, "forcible shm set routes object member.")
+      end
+
+      local succ, err, forcible = req_config_shm:set("routes_member_version", version)
+      if not succ then
+        ngx.log(ngx.ERR, "shm set routes_member_version failed!", err)
+        return nil, err
+      end
+
+      if forcible then
+        ngx.log(ngx.ERR, "forcible shm set routes_member_version.")
+      end
+
+      member_version_shm = version
+    else
+      --other worker
+
+      member_version_shm, flags = req_config_shm:get("routes_member_version")
+
+      if member_version_shm and member_version_shm == router_member_version then
+        ngx.log(ngx.NOTICE, "selected worker has not synchronized router", router_member_version)
+        return nil, "selected worker has not synchronized router"
+      end
+
+      --other worker get routes from shm
+      local routes_member, err
+      local member_enc, flags = req_config_shm:get("routes")
+      if member_enc then
+        routes_member, err = json_safe.decode(member_enc)
         if err then
+          ngx.log(ngx.ERR, "decode routes member failed!", err)
           return nil, err
         end
 
-        local r = {
-          route   = route,
-          service = service,
-        }
 
-        i = i + 1
-        routes[i] = r
+        local routes_fake = {}
+        new_router, err = Router.new(routes_fake)
+
+
+        if not new_router then
+          return nil, "could not create router: " .. err
+        end
+
+        local succ, err = new_router.buildRouterMember(routes_member)
+        if err then
+          ngx.log(ngx.ERR, "assign routes object members failed!", err)
+          return nil, err
+        end
+      else
+        if flags then
+          ngx.log(ngx.ERR, "get shm router member failed!")
+          return nil, "get shm router member failed!"
+        end
+
+        ngx.log(ngx.ERR, "get shm router member empty!")
+        return nil, "get shm router member failed!"
       end
-
-      counter = counter + 1
     end
 
-    local new_router, err = Router.new(routes)
-    if not new_router then
-      return nil, "could not create router: " .. err
-    end
 
+    --assign global router object
     router = new_router
 
     if version then
       router_version = version
     end
+
+    router_member_version = member_version_shm
 
     -- LEGACY - singletons module is deprecated
     singletons.router = router
@@ -722,7 +823,7 @@ do
   end
 
 
-  update_router = function()
+  update_router = function(is_update)
     -- we might not need to rebuild the router (if we were not
     -- the first request in this process to enter this code path)
     -- check again and rebuild only if necessary
@@ -735,7 +836,7 @@ do
       return true
     end
 
-    local ok, err = build_router(version)
+    local ok, err = build_router(version, is_update)
     if not ok then
       return nil, --[[ 'err' fully formatted ]] err
     end
@@ -744,14 +845,73 @@ do
   end
 
 
-  rebuild_router = function(opts)
-    return rebuild("router", update_router, router_version, opts)
+  rebuild_router = function(opts, is_update)
+    local res, err = rebuild("router", update_router, router_version, opts, is_update)
+
+    if is_update then
+      --lock
+      local elapsed, err = lock:lock(ROUTER_BUILD_LOCK)
+      if not elapsed then
+        ngx.log(ngx.ERR, "lock failed!", err)
+        return nil, err
+      end
+
+      --update access time in shm
+      local current_time = ngx.now()
+
+      --unset access time in shm
+      local succ, err, forcible = router_mutex_shm:set(access_time_key, current_time)
+      if not succ then
+        ngx.log(ngx.ERR, "save access time in shm failed!", err)
+        local ok, err = lock:unlock()
+        if not ok then
+          ngx.log(ngx.ERR, "unlock failed!", err)
+        end
+
+        ngx.log(ngx.NOTICE, "check timer pid.", pid_key, -1)
+        local succ, err, forcible = router_mutex_shm:set(pid_key, -1)
+        if not succ then
+          ngx.log(ngx.ERR, "save pid in shm failed!", err)
+          return nil, err
+        end
+
+        if forcible then
+          ngx.log(ngx.ERR, "forcibly save pid in shm.", -1)
+        end
+
+        return nil, err
+      end
+
+      if forcible then
+        ngx.log(ngx.ERR, "forcibly save access time in shm.", current_time)
+      end
+
+      --unlock
+      local ok, err = lock:unlock()
+      if not ok then
+        ngx.log(ngx.ERR, "unlock failed!", err)
+      end
+
+      --unset pid in shm
+      ngx.log(ngx.NOTICE, "check timer pid.", pid_key, -1)
+      local succ, err, forcible = router_mutex_shm:set(pid_key, -1)
+      if not succ then
+        ngx.log(ngx.ERR, "save pid in shm failed!", err)
+        return nil, err
+      end
+
+      if forcible then
+        ngx.log(ngx.ERR, "forcibly save pid in shm.", -1)
+      end
+    end
+
+    return res, err
   end
 
 
   get_updated_router = function()
     if kong.db.strategy ~= "off" and kong.configuration.worker_consistency == "strict" then
-      local ok, err = rebuild_router(ROUTER_SYNC_OPTS)
+      local ok, err = rebuild_router(ROUTER_SYNC_OPTS, true)
       if not ok then
         -- If an error happens while updating, log it and return non-updated
         -- version.
@@ -919,6 +1079,137 @@ local function set_init_versions_in_cache()
   return true
 end
 
+local function routeBeginHandler(premature)
+  if ngx.worker.exiting() then
+    return
+  end
+
+  if premature then
+    return
+  end
+
+  local worker_state_update_frequency = kong.configuration.worker_state_update_frequency or 1
+
+  local ok, err = ngx.timer.at(worker_state_update_frequency / 2, routeBeginHandler)
+  if not ok then
+    ngx.log(ngx.ERR, "create timer failed!", err)
+    return
+  end
+
+  local pid_shm, flags  = router_mutex_shm:get(pid_key)
+  if not pid_shm then
+    pid_shm = -1
+  end
+
+  local pid = ngx.worker.pid()
+  if pid_shm == pid then
+    ngx.log(ngx.NOTICE, "[router build] the worker process is executing timer.")
+    return
+  end
+
+  --lock
+  local elapsed, err = lock:lock(ROUTER_BUILD_LOCK)
+  if not elapsed then
+    ngx.log(ngx.ERR, "lock failed!", err)
+    return
+  end
+
+  local access_time_shm, flags = router_mutex_shm:get(access_time_key)
+  if not access_time_shm then
+    access_time_shm = 0
+  end
+
+  ngx.log(ngx.DEBUG, "get access_time_shm, ", access_time_shm)
+
+  local current_time = ngx.now()
+  local interval = current_time - access_time_shm
+
+  ngx.log(ngx.DEBUG, "router build timer begins. pid_shm: "..pid_shm..", interval: "..interval..", build interval: "..worker_state_update_frequency..", access_time_shm: "..access_time_shm)
+
+  if interval >= worker_state_update_frequency and pid_shm == -1 then
+    ngx.log(ngx.DEBUG, "set pid in shm with lock.")
+
+    ngx.log(ngx.NOTICE, "check timer pid.", pid_key, pid)
+    local succ, err, forcible = router_mutex_shm:set(pid_key, pid)
+    if not succ then
+      ngx.log(ngx.ERR, "save pid in shm failed!", err)
+      local ok, err = lock:unlock()
+      if not ok then
+        ngx.log(ngx.ERR, "unlock failed!", err)
+      end
+      return
+    end
+
+    if forcible then
+      ngx.log(ngx.ERR, "forcibly save pid in shm.")
+    end
+
+    local succ, err, forcible = router_mutex_shm:set(access_time_key, current_time)
+    if not succ then
+      ngx.log(ngx.ERR, "save access time in shm failed!", err)
+      local ok, err = lock:unlock()
+      if not ok then
+        ngx.log(ngx.ERR, "unlock failed!", err)
+      end
+      return
+    end
+
+    if forcible then
+      ngx.log(ngx.ERR, "forcibly save access time in shm.", current_time)
+    end
+  elseif interval >= worker_state_update_frequency * 16 then
+    ngx.log(ngx.NOTICE, "purge timer waits too long.", interval)
+    ngx.log(ngx.NOTICE, "check timer pid.", pid_key, pid)
+
+    local succ, err, forcible = router_mutex_shm:set(pid_key, pid)
+    if not succ then
+      ngx.log(ngx.ERR, "save pid in shm failed!", err)
+      local ok, err = lock:unlock()
+      if not ok then
+        ngx.log(ngx.ERR, "unlock failed!", err)
+      end
+      return
+    end
+
+    if forcible then
+      ngx.log(ngx.ERR, "forcibly save pid in shm.")
+    end
+
+    local succ, err, forcible = router_mutex_shm:set(access_time_key, current_time)
+    if not succ then
+      ngx.log(ngx.ERR, "save access time in shm failed!", err)
+      local ok, err = lock:unlock()
+      if not ok then
+        ngx.log(ngx.ERR, "unlock failed!", err)
+      end
+      return
+    end
+
+    if forcible then
+      ngx.log(ngx.ERR, "forcibly save access time in shm.", current_time)
+    end
+  end
+
+  --unlock
+  local ok, err = lock:unlock()
+  if not ok then
+    ngx.log(ngx.ERR, "unlock failed!", err)
+  end
+
+  local pid_shm, flags = router_mutex_shm:get(pid_key)
+  if not pid_shm then
+    pid_shm = -1
+  end
+
+  if pid_shm == pid then
+    ngx.log(ngx.NOTICE, "[router build] selected worker start.", interval, pid_shm)
+    rebuild_router(ROUTER_ASYNC_OPTS, true)
+  else
+    ngx.log(ngx.NOTICE, "[router build] other worker start.", interval, pid_shm, pid)
+    rebuild_router(ROUTER_ASYNC_OPTS, false)
+  end
+end
+
 
 -- in the table below the `before` and `after` is to indicate when they run:
 -- before or after the plugins
@@ -963,9 +1254,22 @@ return {
         balancer.init()
       end)
 
-      local worker_state_update_frequency = kong.configuration.worker_state_update_frequency or 1
+
 
       if kong.db.strategy ~= "off" then
+        local worker_state_update_frequency = kong.configuration.worker_state_update_frequency or 1
+
+        local now = ngx.time()
+        math.randomseed(now)
+        local t = math.random(worker_state_update_frequency)
+        local ok, err = ngx.timer.at(t, routeBeginHandler)
+        if not ok then
+          ngx.log(ngx.ERR, "create timer failed!", err)
+          return
+        end
+
+
+        --[[
         timer_every(worker_state_update_frequency, function(premature)
           if premature then
             return
@@ -980,6 +1284,7 @@ return {
             log(ERR, "could not rebuild router via timer: ", err)
           end
         end)
+        ]]
 
         timer_every(worker_state_update_frequency, function(premature)
           if premature then
@@ -1033,8 +1338,7 @@ return {
         }
       end
 
-    end,
-    after = NOOP,
+    end
   },
   preread = {
     before = function(ctx)
@@ -1071,8 +1375,7 @@ return {
   certificate = {
     before = function(_)
       certificate.execute()
-    end,
-    after = NOOP,
+    end
   },
   rewrite = {
     before = function(ctx)
@@ -1083,7 +1386,6 @@ return {
       ctx.http_proxy_authorization = var.http_proxy_authorization
       ctx.http_te                  = var.http_te
     end,
-    after = NOOP,
   },
   access = {
     before = function(ctx)
@@ -1119,7 +1421,6 @@ return {
       local forwarded_proto
       local forwarded_host
       local forwarded_port
-      local forwarded_path
       local forwarded_prefix
 
       -- X-Forwarded-* Headers Parsing
@@ -1136,21 +1437,12 @@ return {
         forwarded_proto  = var.http_x_forwarded_proto  or scheme
         forwarded_host   = var.http_x_forwarded_host   or host
         forwarded_port   = var.http_x_forwarded_port   or port
-        forwarded_path   = var.http_x_forwarded_path
         forwarded_prefix = var.http_x_forwarded_prefix
 
       else
         forwarded_proto  = scheme
         forwarded_host   = host
         forwarded_port   = port
-      end
-
-      if not forwarded_path then
-        forwarded_path = var.request_uri
-        local p = find(forwarded_path, "?", 2, true)
-        if p then
-          forwarded_path = sub(forwarded_path, 1, p - 1)
-        end
       end
 
       if not forwarded_prefix and match_t.prefix ~= "/" then
@@ -1244,7 +1536,6 @@ return {
       var.upstream_x_forwarded_proto  = forwarded_proto
       var.upstream_x_forwarded_host   = forwarded_host
       var.upstream_x_forwarded_port   = forwarded_port
-      var.upstream_x_forwarded_path   = forwarded_path
       var.upstream_x_forwarded_prefix = forwarded_prefix
 
       -- At this point, the router and `balancer_setup_stage1` have been
@@ -1257,20 +1548,6 @@ return {
 
         if service.protocol == "grpcs" then
           return ngx.exec("@grpcs")
-        end
-
-        if http_version == 1.1 then
-          if route.request_buffering == false then
-            if route.response_buffering == false then
-              return ngx.exec("@unbuffered")
-            end
-
-            return ngx.exec("@unbuffered_request")
-          end
-
-          if route.response_buffering == false then
-            return ngx.exec("@unbuffered_response")
-          end
         end
       end
     end,
@@ -1358,10 +1635,6 @@ return {
       end
     end
   },
-  response = {
-    before = NOOP,
-    after = NOOP,
-  },
   header_filter = {
     before = function(ctx)
       if not ctx.KONG_PROXIED then
@@ -1411,41 +1684,34 @@ return {
     end,
     after = function(ctx)
       local enabled_headers = kong.configuration.enabled_headers
-      local headers = constants.HEADERS
       if ctx.KONG_PROXIED then
-        if enabled_headers[headers.UPSTREAM_LATENCY] then
-          header[headers.UPSTREAM_LATENCY] = ctx.KONG_WAITING_TIME
+        if enabled_headers[constants.HEADERS.UPSTREAM_LATENCY] then
+          header[constants.HEADERS.UPSTREAM_LATENCY] = ctx.KONG_WAITING_TIME
         end
 
-        if enabled_headers[headers.PROXY_LATENCY] then
-          header[headers.PROXY_LATENCY] = ctx.KONG_PROXY_LATENCY
+        if enabled_headers[constants.HEADERS.PROXY_LATENCY] then
+          header[constants.HEADERS.PROXY_LATENCY] = ctx.KONG_PROXY_LATENCY
         end
 
-        if enabled_headers[headers.VIA] then
-          header[headers.VIA] = server_header
+        if enabled_headers[constants.HEADERS.VIA] then
+          header[constants.HEADERS.VIA] = server_header
         end
 
       else
-        if enabled_headers[headers.RESPONSE_LATENCY] then
-          header[headers.RESPONSE_LATENCY] = ctx.KONG_RESPONSE_LATENCY
+        if enabled_headers[constants.HEADERS.RESPONSE_LATENCY] then
+          header[constants.HEADERS.RESPONSE_LATENCY] = ctx.KONG_RESPONSE_LATENCY
         end
 
-        -- Some plugins short-circuit the request with Via-header, and in those cases
-        -- we don't want to set the Server-header, if the Via-header matches with
-        -- the Kong server header.
-        if not (enabled_headers[headers.VIA] and header[headers.VIA] == server_header) then
-          if enabled_headers[headers.SERVER] then
-            header[headers.SERVER] = server_header
+        if enabled_headers[constants.HEADERS.SERVER] then
+          header[constants.HEADERS.SERVER] = server_header
 
-          else
-            header[headers.SERVER] = nil
-          end
+        else
+          header[constants.HEADERS.SERVER] = nil
         end
       end
     end
   },
   log = {
-    before = NOOP,
     after = function(ctx)
       update_lua_mem()
 

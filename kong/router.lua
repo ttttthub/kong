@@ -545,6 +545,7 @@ local function marshall_route(r)
 
   -- snis
 
+
   if snis then
     if type(snis) ~= "table" then
       return nil, "snis field must be a table"
@@ -973,7 +974,7 @@ do
 
     [MATCH_RULES.SNI] = function(route_t, ctx)
       local sni = route_t.snis[ctx.sni]
-      if sni or ctx.req_scheme == "http" then
+      if sni then
         ctx.matches.sni = ctx.sni
         return true
       end
@@ -1235,10 +1236,6 @@ function _M.new(routes)
         return r1.max_uri_length > r2.max_uri_length
       end
 
-      --if #r1.route.protocols ~= #r2.route.protocols then
-      --  return #r1.route.protocols < #r2.route.protocols
-      --end
-
       if r1.route.created_at ~= nil and r2.route.created_at ~= nil then
         return r1.route.created_at < r2.route.created_at
       end
@@ -1318,6 +1315,8 @@ function _M.new(routes)
                             src_ip, src_port,
                             dst_ip, dst_port,
                             sni, req_headers)
+    
+    
     if req_method and type(req_method) ~= "string" then
       error("method must be a string", 2)
     end
@@ -1357,7 +1356,6 @@ function _M.new(routes)
     ctx.req_method     = req_method
     ctx.req_uri        = req_uri
     ctx.req_host       = req_host
-    ctx.req_scheme     = req_scheme
     ctx.req_headers    = req_headers
     ctx.src_ip         = src_ip or ""
     ctx.src_port       = src_port or ""
@@ -1417,7 +1415,8 @@ function _M.new(routes)
       end
     end
 
-    -- host match
+   -- host match
+    
 
     if plain_indexes.hosts[host_with_port]
       or plain_indexes.hosts[host_no_port]
@@ -1484,7 +1483,7 @@ function _M.new(routes)
     if plain_indexes.sources[ctx.src_ip] then
       req_category = bor(req_category, MATCH_RULES.SRC)
 
-    elseif plain_indexes.sources[ctx.src_port] then
+    elseif plain_indexes.sources[ctx.src_port] and plain_indexes.sources[ctx.src_port]~="userdata" then
       req_category = bor(req_category, MATCH_RULES.SRC)
 
     else
@@ -1501,7 +1500,7 @@ function _M.new(routes)
     if plain_indexes.destinations[ctx.dst_ip] then
       req_category = bor(req_category, MATCH_RULES.DST)
 
-    elseif plain_indexes.destinations[ctx.dst_port] then
+    elseif plain_indexes.destinations[ctx.dst_port] and  plain_indexes.destinations[ctx.dst_port]~="userdata" then
       req_category = bor(req_category, MATCH_RULES.DST)
 
     else
@@ -1525,14 +1524,22 @@ function _M.new(routes)
     -- find our route
 
     if req_category ~= 0x00 then
-      local category_idx = categories_lookup[req_category] or 1
+      local category_idx 
+      if (type(categories_lookup[req_category])=="userdata")  then
+        category_idx = 1
+      else
+         category_idx = categories_lookup[req_category] or 1
+      end
+
       local matched_route
+
 
       while category_idx <= categories_len do
         local bit_category = categories_weight_sorted[category_idx].category_bit
         local category     = categories[bit_category]
 
-        if category then
+
+        if category and type(category)~="userdata" then
           local reduced_candidates, category_candidates = reduce(category,
                                                                  bit_category,
                                                                  ctx)
@@ -1696,10 +1703,52 @@ function _M.new(routes)
     -- no match :'(
   end
 
-
   self.select = find_route
   self._set_ngx = _set_ngx
 
+  function self.retrieveRouterMember()
+    local route_table={}
+    route_table["plain_indexes"] = plain_indexes
+    route_table["prefix_uris"] = prefix_uris
+    route_table["regex_uris"] = regex_uris
+    route_table["wildcard_hosts"] = wildcard_hosts
+    route_table["src_trust_funcs"] = src_trust_funcs
+    route_table["dst_trust_funcs"] = dst_trust_funcs
+    route_table["categories"] = categories
+    route_table["routes_by_id"] = routes_by_id
+    route_table["categories_weight_sorted"] = categories_weight_sorted
+    route_table["categories_lookup"] = categories_lookup
+
+    route_table["categories_len"] = categories_len
+    route_table["grab_req_headers"] = grab_req_headers
+    return route_table
+  end
+
+  function self.test()
+        return plain_indexes
+  end
+
+
+  function self.buildRouterMember(route_table)
+    if type(route_table)~="table" then 
+        ngx.log(ngx.ERR,"route_table is not table")
+        return nil,"route_table is not table"
+    end    
+    plain_indexes = route_table["plain_indexes"]
+    prefix_uris = route_table["prefix_uris"]
+    regex_uris = route_table["regex_uris"]
+    wildcard_hosts = route_table["wildcard_hosts"]
+    src_trust_funcs = route_table["src_trust_funcs"]
+    dst_trust_funcs = route_table["dst_trust_funcs"]
+    categories = route_table["categories"]
+    routes_by_id = route_table["routes_by_id"]
+    categories_weight_sorted = route_table["categories_weight_sorted"]
+    categories_lookup = route_table["categories_lookup"]
+
+    categories_len = route_table["categories_len"]
+    grab_req_headers = route_table["grab_req_headers"]
+  end
+        
   if subsystem == "http" then
     function self.exec()
       local req_method = get_method()
@@ -1775,15 +1824,7 @@ function _M.new(routes)
       -- error value for non-TLS connections ignored intentionally
       local sni, _ = server_name()
 
-      local scheme
-      if var.protocol == "UDP" then
-        scheme = "udp"
-
-      else
-        scheme = sni and "tls" or "tcp"
-      end
-
-      return find_route(nil, nil, nil, scheme,
+      return find_route(nil, nil, nil, nil,
                         src_ip, src_port,
                         dst_ip, dst_port,
                         sni)
